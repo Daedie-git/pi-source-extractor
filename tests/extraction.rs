@@ -371,3 +371,182 @@ fn unqualified_construction_respects_declaration_only_constructor_overloads() {
             .all(|r| r.name == "Item" && r.qualification == "unknown")
     );
 }
+
+#[test]
+fn annotation_prefix_recovery_preserves_original_metadata_and_ranges() {
+    let source = r#"namespace Demo {
+int helper(int value) { return value; }
+struct Item {};
+struct Box {
+    EXPORT_HINT void set(int value) { helper(value); }
+    template<class T>
+    [[nodiscard]] PROJECT_FAST_INLINE Result convert(T value) { return helper(value); }
+    EXPORT_HINT const Item& reference() { return item; }
+    EXPORT_HINT Item* pointer() { return &item; }
+    static EXPORT_HINT int number(int value = 1) { return helper(value); }
+    Item item;
+};
+}
+"#;
+    let output = extract(&mut cpp_parser().unwrap(), source).unwrap();
+    assert!(
+        output.parse_has_error,
+        "Original syntax errors remain visible"
+    );
+    assert!(output.omitted.is_empty(), "{:?}", output.omitted);
+    let names: Vec<_> = output
+        .recovered
+        .iter()
+        .map(|d| d.unit.name.as_str())
+        .collect();
+    assert_eq!(names, ["set", "convert", "reference", "pointer", "number"]);
+    assert!(
+        output
+            .recovered
+            .iter()
+            .all(|d| d.reason == "annotation_prefix_signature")
+    );
+    let normalized = source
+        .replace("EXPORT_HINT", &" ".repeat("EXPORT_HINT".len()))
+        .replace(
+            "PROJECT_FAST_INLINE",
+            &" ".repeat("PROJECT_FAST_INLINE".len()),
+        );
+    let clean = extract(&mut cpp_parser().unwrap(), &normalized).unwrap();
+    assert!(!clean.parse_has_error);
+    assert_eq!(
+        output.units, clean.units,
+        "Scopes, arity and references must match clean syntax"
+    );
+    let convert = output.units.iter().find(|u| u.name == "convert").unwrap();
+    assert_eq!((convert.line, convert.end), (6, 7));
+    assert_eq!(convert.qualified_name, "Demo::Box::convert");
+    assert_eq!(convert.references[0].name, "helper");
+}
+
+#[test]
+fn annotation_recovery_handles_default_braces_crlf_unicode_and_multiline_prefixes() {
+    let source = "// π\r\nstruct Label {};\r\nANNOTATION\r\nint café(Label label = {}) { return 1; }\r\nint after() { return 2; }\r\n";
+    let out = extract(&mut cpp_parser().unwrap(), source).unwrap();
+    let unit = out.units.iter().find(|u| u.name == "café").unwrap();
+    assert_eq!((unit.line, unit.end), (3, 4));
+    assert_eq!((unit.min_args, unit.max_args), (Some(0), Some(1)));
+    assert_eq!(out.recovered.len(), 1);
+    assert_eq!(out.recovered[0].reason, "annotation_prefix_signature");
+    assert_eq!(out.units.last().unwrap().name, "after");
+}
+
+#[test]
+fn annotation_recovery_rejects_broken_bodies_parameters_and_unrecognized_prefixes() {
+    let source = r#"ANNOTATION int valid() { return 1; }
+ANNOTATION int broken_body() { return +; }
+ANNOTATION int broken_parameter(int ???) { return 2; }
+ANNOTATION int broken_return ??? bad() { return 3; }
+ordinary_type int ambiguous() { return 4; }
+XX int short_prefix() { return 5; }
+int neighbor() { return 6; }
+"#;
+    let out = extract(&mut cpp_parser().unwrap(), source).unwrap();
+    assert_eq!(
+        out.units
+            .iter()
+            .map(|u| u.name.as_str())
+            .collect::<Vec<_>>(),
+        ["valid", "neighbor"]
+    );
+    assert_eq!(out.recovered.len(), 1);
+    assert!(out.omitted.iter().any(|d| d.unit.name == "broken_body"));
+    assert!(
+        out.omitted
+            .iter()
+            .any(|d| d.unit.name == "broken_parameter")
+    );
+    assert!(out.omitted.iter().any(|d| d.unit.name == "ambiguous"));
+}
+
+#[test]
+fn annotation_recovery_does_not_repair_invalid_template_parameters() {
+    let source = "template <class T ???>\nANNOTATION int invalid(T x) { return 1; }\nANNOTATION int valid() { return 2; }\n";
+    let out = extract(&mut cpp_parser().unwrap(), source).unwrap();
+    assert!(!out.units.iter().any(|u| u.name == "invalid"));
+    assert!(out.units.iter().any(|u| u.name == "valid"));
+}
+
+#[test]
+fn annotation_recovery_keeps_same_line_neighbors_and_parallel_results_identical() {
+    let source = "int before() { return 0; } ANNOTATION int middle() { return before(); } int after() { return 2; }\n";
+    let out = extract(&mut cpp_parser().unwrap(), source).unwrap();
+    assert_eq!(
+        out.units
+            .iter()
+            .map(|u| u.name.as_str())
+            .collect::<Vec<_>>(),
+        ["before", "middle", "after"]
+    );
+    assert_eq!(out.recovered[0].unit.name, "middle");
+    assert!(out.units.iter().all(|u| u.line == 1 && u.end == 1));
+    let files = || {
+        (0..4)
+            .map(|i| InputFile {
+                path: format!("macro-{i}.cpp"),
+                source: format!("// {}\n{source}", "x".repeat(17000)),
+            })
+            .collect()
+    };
+    let serial = Extractor::new(1).unwrap().process(Request {
+        id: 1,
+        files: files(),
+    });
+    let parallel = Extractor::new(4).unwrap().process(Request {
+        id: 2,
+        files: files(),
+    });
+    assert!(parallel.parallel);
+    for (a, b) in serial.results.iter().zip(parallel.results.iter()) {
+        assert_eq!(a.path, b.path);
+        assert_eq!(a.extraction, b.extraction);
+    }
+}
+
+#[test]
+fn annotation_recovery_uses_validated_return_type_and_qualified_signature() {
+    let source = r#"namespace Library { struct Item { Item() {} }; }
+struct Result { Result() {} };
+namespace Demo {
+    ANNOTATION Library::Item value(int n, int extra = 0) { helper(n); return {}; }
+    template<class T>
+    ANNOTATION Library::List<T> values(T n) { return make(n); }
+    ANNOTATION Result empty() { return {}; }
+    ANNOTATION Library::Item broken(int ???) { return {}; }
+    struct Box { ANNOTATION Library::Item member() { return make(); } };
+}
+"#;
+    let out = extract(&mut cpp_parser().unwrap(), source).unwrap();
+    let clean = extract(
+        &mut cpp_parser().unwrap(),
+        &source.replace("ANNOTATION", "          "),
+    )
+    .unwrap();
+    assert_eq!(out.units, clean.units);
+    assert_eq!(
+        out.recovered
+            .iter()
+            .map(|d| d.unit.name.as_str())
+            .collect::<Vec<_>>(),
+        ["value", "values", "empty", "member"]
+    );
+    let value = out.units.iter().find(|u| u.name == "value").unwrap();
+    assert_eq!(value.qualified_name, "Demo::value");
+    assert_eq!((value.min_args, value.max_args), (Some(1), Some(2)));
+    assert_eq!(
+        value
+            .references
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>(),
+        ["helper", "Item"]
+    );
+    let empty = out.units.iter().find(|u| u.name == "empty").unwrap();
+    assert_eq!(empty.references[0].name, "Result");
+    assert!(!out.units.iter().any(|u| u.name == "broken"));
+}

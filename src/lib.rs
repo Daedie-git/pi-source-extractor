@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use tree_sitter::{Node, Parser};
 mod metadata;
+mod recovery;
 pub use metadata::{Reference, Scope};
 
 pub const MAX_FILES: usize = 64;
@@ -96,6 +97,15 @@ fn name_of(mut node: Node<'_>, source: &str) -> String {
     }
 }
 
+fn default_brace_issue(issue: Node<'_>, body: Node<'_>) -> bool {
+    issue.is_missing()
+        && issue.kind() == "type_identifier"
+        && issue
+            .parent()
+            .is_some_and(|p| p.kind() == "compound_literal_expression")
+        && issue.end_byte() <= body.start_byte()
+}
+
 fn recoverable_signature(node: Node<'_>, body: Node<'_>) -> bool {
     if body.has_error() {
         return false;
@@ -105,12 +115,7 @@ fn recoverable_signature(node: Node<'_>, body: Node<'_>) -> bool {
     visit(node, |issue| {
         if issue.is_error() || issue.is_missing() {
             seen = true;
-            valid &= issue.is_missing()
-                && issue.kind() == "type_identifier"
-                && issue
-                    .parent()
-                    .is_some_and(|p| p.kind() == "compound_literal_expression")
-                && issue.end_byte() <= body.start_byte();
+            valid &= default_brace_issue(issue, body);
         }
     });
     seen && valid
@@ -122,6 +127,7 @@ pub fn extract(parser: &mut Parser, source: &str) -> Result<Extraction, String> 
     }
     let tree = parser.parse(source, None).ok_or("parse cancelled")?;
     let scopes = metadata::scope_index(tree.root_node(), source);
+    let annotations = recovery::annotation_prefixes(parser, &tree, source, &scopes)?;
     let mut output = Extraction {
         units: vec![],
         parse_has_error: tree.root_node().has_error(),
@@ -133,6 +139,14 @@ pub fn extract(parser: &mut Parser, source: &str) -> Result<Extraction, String> 
             return;
         }
         let body = node.child_by_field_name("body");
+        if let Some(unit) = annotations.get(&(node.start_byte(), node.end_byte())) {
+            output.units.push(unit.clone());
+            output.recovered.push(Diagnostic {
+                unit: unit.clone(),
+                reason: "annotation_prefix_signature".into(),
+            });
+            return;
+        }
         let recovered = node.has_error() && body.is_some_and(|b| recoverable_signature(node, b));
         let accepted = body.is_some() && (!node.has_error() || recovered);
         let start = if accepted {
