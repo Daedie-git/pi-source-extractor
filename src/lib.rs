@@ -2,6 +2,8 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use tree_sitter::{Node, Parser};
+mod metadata;
+pub use metadata::{Reference, Scope};
 
 pub const MAX_FILES: usize = 64;
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
@@ -14,10 +16,17 @@ pub fn default_threads() -> usize {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct Unit {
     pub name: String,
     pub line: usize,
     pub end: usize,
+    pub scope: Vec<Scope>,
+    pub qualified_name: String,
+    pub kind: String,
+    pub min_args: Option<usize>,
+    pub max_args: Option<usize>,
+    pub references: Vec<Reference>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,6 +121,7 @@ pub fn extract(parser: &mut Parser, source: &str) -> Result<Extraction, String> 
         return Err("source exceeds 4 MiB".into());
     }
     let tree = parser.parse(source, None).ok_or("parse cancelled")?;
+    let scopes = metadata::scope_index(tree.root_node(), source);
     let mut output = Extraction {
         units: vec![],
         parse_has_error: tree.root_node().has_error(),
@@ -132,14 +142,18 @@ pub fn extract(parser: &mut Parser, source: &str) -> Result<Extraction, String> 
         } else {
             node
         };
-        let unit = Unit {
-            name: node
-                .child_by_field_name("declarator")
-                .map(|n| name_of(n, source))
-                .unwrap_or_else(|| "anonymous".into()),
-            line: start.start_position().row + 1,
-            end: node.end_position().row + 1,
-        };
+        let name = node
+            .child_by_field_name("declarator")
+            .map(|n| name_of(n, source))
+            .unwrap_or_else(|| "anonymous".into());
+        let unit = metadata::unit(
+            node,
+            source,
+            &scopes,
+            name,
+            start.start_position().row + 1,
+            node.end_position().row + 1,
+        );
         if accepted {
             output.units.push(unit.clone());
             if recovered {

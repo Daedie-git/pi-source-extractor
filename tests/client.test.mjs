@@ -106,3 +106,18 @@ test('CLI default detects physical cores and overrides remain capped by file cou
   try { assert.equal((await worker.extract(files)).workerThreads,3); }
   finally {worker.close();}
 });
+
+test('scope, reference qualification and constructor arity survive JSONL and materialization', async () => {
+  const worker = new Extractor();
+  try {
+    const source = 'namespace N { struct X { X(int n, int optional=0) {} static X make() { return X{1}; } }; }';
+    const { results } = await worker.extract([{ path: 'metadata.cpp', source }]);
+    const units = materialize('metadata.cpp', source, results[0].extraction);
+    assert.equal(units[0].qualifiedName, 'N::X::X');
+    assert.equal(units[0].kind, 'constructor');
+    assert.equal(units[0].minArgs, 1);
+    assert.equal(units[0].maxArgs, 2);
+    assert.deepEqual(units[1].references, [{ kind: 'construct', name: 'X', qualification: 'unqualified', qualifier: [], arguments: 1 }]);
+    assert.equal(units[1].scope[1].kind, 'type');
+  } finally { worker.close(); }
+});

@@ -173,3 +173,201 @@ fn physical_core_default_is_used_as_the_concurrency_limit() {
     });
     assert_eq!(response.worker_threads, cores.min(3));
 }
+
+#[test]
+fn scoped_references_ignore_text_receivers_signatures_and_nested_scopes() {
+    let source = r#"
+namespace One { int helper(int n) { return n; } }
+namespace Two {
+int helper(int n) { return n + 1; }
+struct Box {
+    void reserve(int n) {}
+    void work(int signature = helper(8)) {
+        // reserve(1); One::helper(2);
+        const char* text = "reserve(1); One::helper(2);";
+        this->reserve(4);
+        other.reserve(5);
+        helper(6);
+        One::helper(7);
+        auto nested = [] { reserve(9); };
+    }
+};
+}
+void Two::Box::outside() { this->reserve(1); helper(2); }
+"#;
+    let out = extract(&mut cpp_parser().unwrap(), source).unwrap();
+    let work = out.units.iter().find(|u| u.name == "work").unwrap();
+    assert_eq!(work.qualified_name, "Two::Box::work");
+    assert_eq!(
+        work.scope
+            .iter()
+            .map(|s| (s.kind.as_str(), s.name.as_str()))
+            .collect::<Vec<_>>(),
+        [("namespace", "Two"), ("type", "Box")]
+    );
+    assert_eq!(
+        work.references
+            .iter()
+            .map(|r| (r.name.as_str(), r.qualification.as_str(), r.arguments))
+            .collect::<Vec<_>>(),
+        [
+            ("reserve", "this", 1),
+            ("reserve", "unknown", 1),
+            ("helper", "unqualified", 1),
+            ("helper", "qualified", 1)
+        ]
+    );
+    assert_eq!(work.references[3].qualifier, ["One"]);
+    let outside = out.units.iter().find(|u| u.name == "outside").unwrap();
+    assert_eq!(outside.qualified_name, "Two::Box::outside");
+    assert_eq!(outside.scope, work.scope);
+    assert_eq!(
+        out.units
+            .iter()
+            .filter(|u| u.name == "helper")
+            .map(|u| u.qualified_name.as_str())
+            .collect::<Vec<_>>(),
+        ["One::helper", "Two::helper"]
+    );
+}
+
+#[test]
+fn constructor_references_and_arity_preserve_default_argument_overloads() {
+    let source = r#"
+namespace N {
+struct Item {
+    Item(int one) {}
+    Item(int a, int b, int c, int d = {}, int e = {}) {}
+    static Item factory() { Item value {1, 2, 3, 4}; return value; }
+    static Item returned() { return {1, 2, 3}; }
+};
+void work() { Item(1); Item{1}; Item x(1); Item empty; Item* pointer; }
+}
+"#;
+    let out = extract(&mut cpp_parser().unwrap(), source).unwrap();
+    let ctors: Vec<_> = out
+        .units
+        .iter()
+        .filter(|u| u.kind == "constructor")
+        .collect();
+    assert_eq!(ctors.len(), 2);
+    assert_eq!((ctors[0].min_args, ctors[0].max_args), (Some(1), Some(1)));
+    assert_eq!((ctors[1].min_args, ctors[1].max_args), (Some(3), Some(5)));
+    assert_eq!(ctors[1].qualified_name, "N::Item::Item");
+    let factory = out.units.iter().find(|u| u.name == "factory").unwrap();
+    assert_eq!(factory.references.len(), 1);
+    assert_eq!(
+        (
+            &*factory.references[0].kind,
+            &*factory.references[0].name,
+            factory.references[0].arguments
+        ),
+        ("construct", "Item", 4)
+    );
+    let returned = out.units.iter().find(|u| u.name == "returned").unwrap();
+    assert_eq!(returned.references[0].arguments, 3);
+    let work = out.units.iter().find(|u| u.name == "work").unwrap();
+    assert_eq!(
+        work.references
+            .iter()
+            .map(|r| (r.kind.as_str(), r.arguments))
+            .collect::<Vec<_>>(),
+        [("call", 1), ("construct", 1), ("construct", 0)]
+    );
+}
+
+#[test]
+fn uncertain_overloads_and_local_callable_shadowing_are_not_guessed() {
+    let source = r#"
+void helper(int n) {}
+void helper(double n) {}
+void variadic(int n, ...) {}
+void f(void (*callback)(), int parameter) {
+    int helper, other;
+    helper(); other(); callback(); parameter();
+}
+void Unknown::method() { helper(1); }
+"#;
+    let out = extract(&mut cpp_parser().unwrap(), source).unwrap();
+    let helpers: Vec<_> = out.units.iter().filter(|u| u.name == "helper").collect();
+    assert_eq!(helpers.len(), 2);
+    assert_eq!(helpers[0].qualified_name, helpers[1].qualified_name);
+    assert_eq!(helpers[0].min_args, helpers[1].min_args);
+    assert_eq!(
+        out.units
+            .iter()
+            .find(|u| u.name == "variadic")
+            .unwrap()
+            .max_args,
+        None
+    );
+    let f = out.units.iter().find(|u| u.name == "f").unwrap();
+    assert_eq!(f.references.iter().filter(|r| r.kind == "call").count(), 4);
+    assert!(
+        f.references
+            .iter()
+            .filter(|r| r.kind == "call")
+            .all(|r| r.qualification == "unknown")
+    );
+    assert_eq!(
+        out.units.iter().find(|u| u.name == "method").unwrap().scope[0].kind,
+        "unknown"
+    );
+}
+
+#[test]
+fn constructor_initializer_calls_are_kept_but_not_field_initializers() {
+    let source = "struct X { int member; X(int n) : member(helper(n)) {} };";
+    let out = extract(&mut cpp_parser().unwrap(), source).unwrap();
+    assert_eq!(out.units[0].references.len(), 1);
+    assert_eq!(out.units[0].references[0].name, "helper");
+}
+
+#[test]
+fn declarations_imports_and_unknown_owners_block_unsafe_fallthrough() {
+    let source = r#"
+void helper() {}
+struct A { void helper(); void run() { helper(); this->helper(); } };
+namespace N { void other(int n) {} void other(double n); }
+void qualified() { N::other(1); }
+void imported() { using N::other; other(1); }
+void Unknown::owner() { helper(); }
+namespace Aliased { struct A { static void help() {} }; }
+void alias() { using A = Aliased::A; A::help(); }
+"#;
+    let out = extract(&mut cpp_parser().unwrap(), source).unwrap();
+    for name in ["run", "qualified", "imported", "owner", "alias"] {
+        let unit = out.units.iter().find(|u| u.name == name).unwrap();
+        assert!(!unit.references.is_empty(), "{name}");
+        assert!(
+            unit.references.iter().all(|r| r.qualification == "unknown"),
+            "{name}: {:?}",
+            unit.references
+        );
+    }
+}
+
+#[test]
+fn explicit_static_calls_and_global_names_retain_qualification() {
+    let source = "namespace N { struct Builder { static void build() {} }; void helper() {} } void f() { N::Builder::build(); ::N::helper(); }";
+    let out = extract(&mut cpp_parser().unwrap(), source).unwrap();
+    let f = out.units.iter().find(|u| u.name == "f").unwrap();
+    assert_eq!(f.references.len(), 2);
+    assert_eq!(f.references[0].qualifier, ["N", "Builder"]);
+    assert_eq!(f.references[1].qualifier, ["", "N"]);
+    assert!(f.references.iter().all(|r| r.qualification == "qualified"));
+}
+
+#[test]
+fn unqualified_construction_respects_declaration_only_constructor_overloads() {
+    let source =
+        "struct Item { Item(int n) {} Item(double n); }; void f() { Item value{1.5}; Item(1.5); }";
+    let out = extract(&mut cpp_parser().unwrap(), source).unwrap();
+    let f = out.units.iter().find(|u| u.name == "f").unwrap();
+    assert_eq!(f.references.len(), 2);
+    assert!(
+        f.references
+            .iter()
+            .all(|r| r.name == "Item" && r.qualification == "unknown")
+    );
+}

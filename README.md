@@ -55,12 +55,25 @@ Each request is one JSON line with an integer `id` and `files: [{path, source}]`
 
 ```json
 {
-  "units": [{"name": "example", "line": 1, "end": 1}],
+  "units": [{
+    "name": "example", "line": 1, "end": 1,
+    "scope": [], "qualifiedName": "example", "kind": "function",
+    "minArgs": 0, "maxArgs": 0, "references": []
+  }],
   "parseHasError": false,
   "omitted": [],
   "recovered": []
 }
 ```
+
+Each unit includes conservative syntax metadata for callers that select supporting helpers:
+
+- `scope` lists lexical namespace/type owners as `{kind, name}`. Out-of-line qualifiers use same-file declarations to identify owners; unresolved owners have kind `unknown`.
+- `qualifiedName` combines the owner path and existing unit name. `kind` is `function` or `constructor`.
+- `minArgs` and `maxArgs` count required and total parameters, including defaults. Unsupported/variadic signatures use `null`. Arity does not resolve overloads by argument type.
+- `references` records body and constructor-initializer calls or construction expressions as `{kind, name, qualification, qualifier, arguments}`. Reference kind is `call` or `construct`; qualification is `unqualified`, `qualified`, `this`, or `unknown`. A leading empty qualifier component denotes global `::`.
+
+Comments, strings, signature expressions, and nested lambda/local-class bodies do not become references of the enclosing function. Arbitrary object receivers, shadowed names, declaration-only overloads, unresolved owners, aliases and uncertain using/inheritance lookup are conservatively marked `unknown` where detected. Some valid helpers will consequently be skipped. Template-dependent expressions and unsupported syntax may have no reference entry. This metadata is neither complete name lookup nor a call graph: callers must skip unknown references and ambiguous overloads, and must not fall back to bare-name matching. The original `name`, `line`, `end` and materialized source-text contract is unchanged.
 
 File failures contain `error` instead of `extraction`. Request errors contain top-level `error`; malformed JSON has `id: null`. Syntax errors are diagnostic data, not transport errors. Functions with erroneous bodies are omitted. A narrow recovery accepts a known Tree-sitter default-argument `= {}` signature error only when all errors match that condition and the body parses cleanly. Deleted/defaulted methods without bodies are recorded as omitted. Nested functions/constructs retain preorder. Whole-line ranges can include neighboring text on the same line.
 
