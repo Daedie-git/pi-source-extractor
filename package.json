@@ -1,0 +1,12 @@
+{
+  "name": "pi-source-extractor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./js/index.mjs",
+  "scripts": {
+    "build": "cargo build --release --locked",
+    "test": "node --test tests/client.test.mjs"
+  },
+  "engines": { "node": ">=22" }
+}
