@@ -1,8 +1,8 @@
-use pi_source_extractor::{Extractor, MAX_REQUEST_BYTES, Request, Response};
+use pi_source_extractor::{Extractor, MAX_REQUEST_BYTES, Request, Response, default_threads};
 use std::io::{self, BufRead, Read, Write};
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
+    let mut threads = default_threads();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -10,7 +10,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--threads" => threads = args.next().ok_or("missing thread count")?.parse()?,
             "--help" | "-h" => {
                 println!(
-                    "pi-source-extractor [--stdio] [--threads 1..32]\nJSONL stdin: {{\"id\":1,\"files\":[{{\"path\":\"example.cpp\",\"source\":\"int f() {{ return 1; }}\"}}]}}\nOne ordered JSON response per request. Default: up to 4 threads; small batches stay serial."
+                    "pi-source-extractor [--stdio] [--threads N]\nJSONL stdin: {{\"id\":1,\"files\":[{{\"path\":\"example.cpp\",\"source\":\"int f() {{ return 1; }}\"}}]}}\nOne ordered JSON response per request. Default: physical core count ({}) capped at the batch file count; --threads N overrides the core count. Small batches stay serial.",
+                    default_threads()
                 );
                 return Ok(());
             }

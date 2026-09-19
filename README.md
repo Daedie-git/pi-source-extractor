@@ -21,7 +21,7 @@ The executable is `target/release/pi-source-extractor` (`.exe` on Windows). Keep
 ```js
 import { Extractor, materialize } from './js/index.mjs';
 
-const extractor = new Extractor({ threads: 4 });
+const extractor = new Extractor(); // Physical cores by default; { threads: 8 } overrides it.
 try {
   const source = 'int answer() { return 42; }';
   const response = await extractor.extract([{ path: 'answer.cpp', source }]);
@@ -40,7 +40,9 @@ The client starts the worker lazily, correlates concurrent requests, and bounds 
 
 ## Parallelism
 
-Each parser is owned by one thread and reused. Single files and batches below 64 KiB of combined source are processed serially. Larger multi-file batches use an ordered Rayon parallel iterator. The pool is created lazily; default concurrency is available CPUs capped at four, configurable from one to 32. Parallelism is across files, not within an individual parse. Output order always matches input order. Small-batch threshold and default thread count are conservative policies, not universal optimums.
+Each parser is owned by one thread and reused. The default concurrency limit is the detected **number of physical CPU cores**. Override it with `--threads N` on the CLI or `{ threads: N }` in the Node client. In every batch, concurrency is capped at the **number of input files**, including when an override exceeds that count. Physical-core detection supports Linux, macOS and Windows; the dependency falls back to logical CPU count if physical detection is unavailable.
+
+Single files and batches below 64 KiB of combined source are processed serially. Larger multi-file batches use an ordered Rayon parallel iterator. The pool is created lazily and reused while its required size stays the same; changing batch size can rebuild the pool to maintain the file-count cap. Empty/serial batches release an existing pool. Parallelism is across files, not within an individual parse. Output order always matches input order. The small-batch threshold is a conservative policy, not a universal optimum.
 
 ## Protocol
 
@@ -49,7 +51,7 @@ printf '%s\n' '{"id":1,"files":[{"path":"example.cpp","source":"int example() { 
   | target/release/pi-source-extractor --stdio --threads 4
 ```
 
-Each request is one JSON line with an integer `id` and `files: [{path, source}]`. Each response has the same `id`, ordered `results`, and `parallel`. A successful file result contains `path` and `extraction`:
+Each request is one JSON line with an integer `id` and `files: [{path, source}]`. Each response has the same `id`, ordered `results`, `parallel`, and `workerThreads` (zero for an empty batch or top-level request error, one for serial work, or the capped pool size). A successful file result contains `path` and `extraction`:
 
 ```json
 {

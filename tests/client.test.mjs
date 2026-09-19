@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Extractor, materialize } from '../js/index.mjs';
 
 test('persistent client, concurrent callers, Unicode and line materialization', async () => {
@@ -84,4 +85,24 @@ test('idle worker does not keep its Node parent alive', () => {
   const child=spawnSync(process.execPath,['--input-type=module','-e',script],{timeout:2000,encoding:'utf8'});
   assert.equal(child.error,undefined);
   assert.equal(child.status,0,child.stderr);
+});
+
+test('CLI default detects physical cores and overrides remain capped by file count', async () => {
+  const binary=fileURLToPath(new URL(`../target/release/pi-source-extractor${process.platform==='win32'?'.exe':''}`,import.meta.url));
+  const help=spawnSync(binary,['--help'],{encoding:'utf8'});
+  assert.equal(help.status,0);
+  const detected=Number(help.stdout.match(/physical core count \((\d+)\)/)?.[1]);
+  assert.ok(detected>=1);
+  const files=Array.from({length:3},(_,i)=>({path:`file-${i}.cpp`,source:`// ${'x'.repeat(40000)}\nint f${i}() {}` }));
+  for(const [args,expected] of [[[],Math.min(detected,3)],[['--threads','1'],1],[['--threads','64'],3]]) {
+    const result=spawnSync(binary,args,{input:JSON.stringify({id:1,files})+'\n',encoding:'utf8'});
+    assert.equal(result.status,0,result.stderr);
+    assert.equal(JSON.parse(result.stdout).workerThreads,expected);
+  }
+  const invalid=spawnSync(binary,['--threads','0'],{encoding:'utf8'});
+  assert.notEqual(invalid.status,0);
+  assert.match(invalid.stderr,/positive integer/);
+  const worker=new Extractor({threads:64});
+  try { assert.equal((await worker.extract(files)).workerThreads,3); }
+  finally {worker.close();}
 });

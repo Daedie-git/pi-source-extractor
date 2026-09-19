@@ -1,13 +1,17 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::sync::OnceLock;
 use tree_sitter::{Node, Parser};
 
 pub const MAX_FILES: usize = 64;
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const PARALLEL_MIN_BYTES: usize = 64 * 1024;
+
+/// Physical cores where supported; num_cpus falls back to logical CPUs otherwise.
+pub fn default_threads() -> usize {
+    num_cpus::get_physical().max(1)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Unit {
@@ -188,6 +192,7 @@ pub struct Response {
     pub id: Option<u64>,
     pub results: Vec<FileResult>,
     pub parallel: bool,
+    pub worker_threads: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -198,6 +203,7 @@ impl Response {
             id,
             results: vec![],
             parallel: false,
+            worker_threads: 0,
             error: Some(message.into()),
         }
     }
@@ -208,37 +214,53 @@ thread_local! { static PARSER: RefCell<Result<Parser, String>> = RefCell::new(cp
 pub struct Extractor {
     parser: Parser,
     threads: usize,
-    pool: OnceLock<rayon::ThreadPool>,
+    pool: Option<rayon::ThreadPool>,
 }
 
 impl Extractor {
     pub fn new(threads: usize) -> Result<Self, String> {
-        if !(1..=32).contains(&threads) {
-            return Err("threads must be between 1 and 32".into());
+        if threads == 0 {
+            return Err("threads must be a positive integer".into());
         }
         Ok(Self {
             parser: cpp_parser()?,
             threads,
-            pool: OnceLock::new(),
+            pool: None,
         })
     }
 
     pub fn process(&mut self, request: Request) -> Response {
         if request.files.len() > MAX_FILES {
+            self.pool = None;
             return Response::error(Some(request.id), "batch exceeds 64 files");
         }
         let bytes: usize = request.files.iter().map(|f| f.source.len()).sum();
         if bytes > MAX_REQUEST_BYTES {
+            self.pool = None;
             return Response::error(Some(request.id), "batch source exceeds 16 MiB");
         }
-        let parallel = self.threads > 1 && request.files.len() > 1 && bytes >= PARALLEL_MIN_BYTES;
-        if parallel && self.pool.get().is_none() {
+        let capped_threads = self.threads.min(request.files.len());
+        let parallel = capped_threads > 1 && bytes >= PARALLEL_MIN_BYTES;
+        let worker_threads = if parallel {
+            capped_threads
+        } else {
+            request.files.len().min(1)
+        };
+        if self
+            .pool
+            .as_ref()
+            .is_some_and(|pool| !parallel || pool.current_num_threads() != worker_threads)
+        {
+            // Reuse a matching pool, but never retain an oversized pool after a smaller batch.
+            self.pool = None;
+        }
+        if parallel && self.pool.is_none() {
             match rayon::ThreadPoolBuilder::new()
-                .num_threads(self.threads)
+                .num_threads(worker_threads)
                 .build()
             {
                 Ok(pool) => {
-                    let _ = self.pool.set(pool);
+                    self.pool = Some(pool);
                 }
                 Err(e) => return Response::error(Some(request.id), e.to_string()),
             }
@@ -263,7 +285,7 @@ impl Extractor {
             }
         }
         let results = if parallel {
-            self.pool.get().unwrap().install(|| {
+            self.pool.as_ref().unwrap().install(|| {
                 request
                     .files
                     .par_iter()
@@ -290,6 +312,10 @@ impl Extractor {
             id: Some(request.id),
             results,
             parallel,
+            worker_threads: self
+                .pool
+                .as_ref()
+                .map_or(worker_threads, |pool| pool.current_num_threads()),
             error: None,
         }
     }

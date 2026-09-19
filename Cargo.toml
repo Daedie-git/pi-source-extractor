@@ -6,6 +6,7 @@ description = "Persistent, batched C++ source extraction for coding agents"
 license = "MIT"
 
 [dependencies]
+num_cpus = "1.17"
 rayon = "1.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

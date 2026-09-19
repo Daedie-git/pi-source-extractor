@@ -124,3 +124,52 @@ fn many_macro_functions_have_exact_unaliased_positions() {
         }
     }
 }
+
+#[test]
+fn configured_threads_are_capped_as_batches_grow_and_shrink() {
+    let mut worker = Extractor::new(64).unwrap();
+    for count in [3, 6, 2, 1, 0, 4, 4] {
+        let response = worker.process(Request {
+            id: count as u64,
+            files: (0..count)
+                .map(|i| InputFile {
+                    path: format!("input-{i}.cpp"),
+                    source: format!("// {}\nint f{i}() {{ return {i}; }}", "x".repeat(40000)),
+                })
+                .collect(),
+        });
+        assert_eq!(response.worker_threads, count);
+        assert_eq!(response.parallel, count > 1);
+        assert_eq!(response.results.len(), count);
+        assert!(response.results.iter().all(|result| result.error.is_none()));
+    }
+    let tiny = worker.process(Request {
+        id: 100,
+        files: (0..3)
+            .map(|i| InputFile {
+                path: format!("small-{i}.cpp"),
+                source: format!("int small{i}() {{}}"),
+            })
+            .collect(),
+    });
+    assert_eq!(tiny.worker_threads, 1);
+    assert!(!tiny.parallel);
+    assert!(Extractor::new(0).is_err());
+}
+
+#[test]
+fn physical_core_default_is_used_as_the_concurrency_limit() {
+    let cores = pi_source_extractor::default_threads();
+    assert_eq!(cores, num_cpus::get_physical().max(1));
+    let mut worker = Extractor::new(cores).unwrap();
+    let response = worker.process(Request {
+        id: 1,
+        files: (0..3)
+            .map(|i| InputFile {
+                path: format!("default-{i}.cpp"),
+                source: format!("// {}\nint default{i}() {{}}", "x".repeat(40000)),
+            })
+            .collect(),
+    });
+    assert_eq!(response.worker_threads, cores.min(3));
+}

@@ -15,7 +15,7 @@ export class Extractor {
   #stderr = '';
 
   constructor({ binary = DEFAULT_BINARY, threads, timeoutMs = 10000, maxPending = 8 } = {}) {
-    if (threads !== undefined && (!Number.isInteger(threads) || threads < 1 || threads > 32)) throw new Error('threads must be 1..32');
+    if (threads !== undefined && (!Number.isSafeInteger(threads) || threads < 1)) throw new Error('threads must be a positive safe integer');
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('timeoutMs must be positive');
     if (!Number.isInteger(maxPending) || maxPending < 1 || maxPending > 64) throw new Error('maxPending must be 1..64');
     this.binary = binary;
