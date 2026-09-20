@@ -68,6 +68,7 @@ pub struct ScopeIndex {
     kinds: HashMap<String, String>,
     blocked: HashMap<String, HashSet<String>>,
     uncertain: HashSet<String>,
+    defined_members: HashMap<String, HashSet<String>>,
 }
 
 fn scope_path(scope: &[Scope]) -> String {
@@ -103,6 +104,7 @@ pub fn scope_index(root: Node<'_>, source: &str) -> ScopeIndex {
         kinds: HashMap::new(),
         blocked: HashMap::new(),
         uncertain: HashSet::new(),
+        defined_members: HashMap::new(),
     };
     visit(root, |node| {
         if !matches!(
@@ -171,6 +173,29 @@ pub fn scope_index(root: Node<'_>, source: &str) -> ScopeIndex {
         for name in names {
             path.push(name);
             index.kinds.insert(path.join("::"), kind.into());
+        }
+    });
+    visit(root, |node| {
+        if node.kind() != "function_definition" {
+            return;
+        }
+        let scope = lexical_scope(node, source);
+        if !scope.last().is_some_and(|s| s.kind == "type") {
+            return;
+        }
+        let name = node
+            .child_by_field_name("declarator")
+            .and_then(function_declarator)
+            .and_then(|d| d.child_by_field_name("declarator"))
+            .and_then(|n| parts(text(n, source)));
+        if let Some(names) = name
+            && names.len() == 1
+        {
+            index
+                .defined_members
+                .entry(scope_path(&scope))
+                .or_default()
+                .insert(names[0].clone());
         }
     });
     index
@@ -351,12 +376,13 @@ pub fn unit(
             }
             uncertain |= index.uncertain.contains(&path);
         }
+        let mut local_uncertain = false;
         let mut record_binding = |n: Node<'_>| {
             if matches!(
                 n.kind(),
                 "using_declaration" | "alias_declaration" | "type_definition"
             ) {
-                uncertain = true;
+                local_uncertain = true;
             }
             if matches!(
                 n.kind(),
@@ -467,7 +493,20 @@ pub fn unit(
                     _ => None,
                 };
                 if let Some(mut r) = candidate {
-                    let mut blocked = uncertain && r.qualification != "unknown";
+                    // A definite member in this class hides names imported by an
+                    // outer namespace. Same-scope ambiguity, local bindings and
+                    // unknown receivers remain conservative.
+                    let own_scope = scope_path(&scope);
+                    let known_member = matches!(r.qualification.as_str(), "unqualified" | "this")
+                        && scope.last().is_some_and(|s| s.kind == "type")
+                        && !scope.iter().any(|s| s.kind == "unknown")
+                        && !index.uncertain.contains(&own_scope)
+                        && index
+                            .defined_members
+                            .get(&own_scope)
+                            .is_some_and(|names| names.contains(&r.name));
+                    let mut blocked = (local_uncertain || (uncertain && !known_member))
+                        && r.qualification != "unknown";
                     if matches!(r.qualification.as_str(), "unqualified" | "this") {
                         blocked |= shadows.contains(&r.name);
                         // A type's declaration-only constructor overload can shadow its

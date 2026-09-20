@@ -550,3 +550,47 @@ namespace Demo {
     assert_eq!(empty.references[0].name, "Result");
     assert!(!out.units.iter().any(|u| u.name == "broken"));
 }
+
+#[test]
+fn own_member_hides_outer_namespace_import_without_relaxing_unknown_calls() {
+    let source = r#"
+namespace external { void capture(int); }
+namespace local {
+using namespace external;
+struct Decoder {
+ void capture(int value) { (void)value; }
+ void wrapper(int value) { capture(value); this->capture(value); foreign.capture(value); }
+ void shadowed(void (*capture)(int)) { capture(1); }
+ void aliased() { using external::capture; capture(1); }
+};
+struct Base {};
+struct Derived : Base { void capture(int) {} void wrapper() { capture(1); } };
+struct Imported { using external::capture; void capture(int) {} void wrapper() { capture(1); } };
+}
+"#;
+    let out = extract(&mut cpp_parser().unwrap(), source).unwrap();
+    let find = |name: &str| out.units.iter().find(|u| u.qualified_name == name).unwrap();
+    let wrapper = find("local::Decoder::wrapper");
+    for qualification in ["unqualified", "this", "unknown"] {
+        assert!(
+            wrapper
+                .references
+                .iter()
+                .any(|r| r.name == "capture" && r.qualification == qualification)
+        );
+    }
+    for name in [
+        "local::Decoder::shadowed",
+        "local::Decoder::aliased",
+        "local::Derived::wrapper",
+        "local::Imported::wrapper",
+    ] {
+        assert!(
+            find(name)
+                .references
+                .iter()
+                .filter(|r| r.name == "capture")
+                .all(|r| r.qualification == "unknown")
+        );
+    }
+}
